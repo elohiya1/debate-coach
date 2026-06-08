@@ -1,137 +1,144 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ScoreResult } from './api/score/route';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const TOPICS = [
+  'AI will do more harm than good',
+  'Social media has a net negative effect on society',
+  'Universal Basic Income should be implemented',
+  'Space exploration should be prioritized over ocean exploration',
+  'Remote work is better than office work',
+  'Cryptocurrencies should replace traditional banking',
+];
+
+const DIFFICULTY = {
+  beginner:     { label: 'Beginner',     description: 'Gentle arguments, occasional concessions' },
+  intermediate: { label: 'Intermediate', description: 'Balanced, challenges weak reasoning' },
+  expert:       { label: 'Expert',       description: 'Relentless, exposes every flaw' },
+} as const;
+type Difficulty = keyof typeof DIFFICULTY;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-type Status = 'idle' | 'connecting' | 'active' | 'stopped' | 'error';
+type Phase     = 'setup' | 'debate' | 'scoring' | 'results';
+type TurnState = 'idle' | 'listening' | 'processing' | 'speaking';
 
 interface Message {
   id: number;
-  role: 'user' | 'agent';
+  role: 'user' | 'ai';
   text: string;
-}
-
-interface FeedbackItem {
-  id: number;
-  rating: number;
-  note: string;
-}
-
-interface Role {
-  id: string;
-  label: string;
-  emoji: string;
-  description: string;
-  prompt: string;
-  greeting: string;
+  fallacy?: { name: string; explanation: string } | null;
+  fallacyLoading?: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Role definitions
+// Helpers
 // ---------------------------------------------------------------------------
 
-const ROLES: Role[] = [
-  {
-    id: 'swe',
-    label: 'Software Engineer',
-    emoji: '💻',
-    description: 'Big Tech, FAANG, startups',
-    prompt:
-      'software engineering roles at top tech companies like Google, Meta, Amazon, or high-growth startups. Focus on technical leadership, system design decisions, and collaboration.',
-    greeting: "Hey! I'm your interview coach. Let's prep for software engineering. Which company or type of role are you targeting?",
-  },
-  {
-    id: 'consultant',
-    label: 'Consultant',
-    emoji: '💼',
-    description: 'McKinsey, BCG, Bain & top firms',
-    prompt:
-      'management consulting roles at top firms like McKinsey, BCG, or Bain. Focus on structured thinking, leadership, client impact, and driving change under ambiguity.',
-    greeting: "Hi! Ready to prep for consulting? I'll walk you through behavioral questions. Which firm or practice area are you targeting?",
-  },
-  {
-    id: 'banker',
-    label: 'Investment Banker',
-    emoji: '🏦',
-    description: 'Bulge bracket & boutique banks',
-    prompt:
-      'investment banking roles at bulge bracket or boutique banks. Focus on work ethic, attention to detail, deal experience, client relationships, and navigating high-pressure environments.',
-    greeting: "Hey, let's get you ready for banking interviews. Behavioral questions are critical here. What bank or group are you targeting?",
-  },
-  {
-    id: 'pm',
-    label: 'Product Manager',
-    emoji: '📱',
-    description: 'Tech companies & startups',
-    prompt:
-      'product management roles at tech companies. Focus on customer empathy, data-driven decisions, cross-functional leadership, prioritization, and shipping impactful products.',
-    greeting: "Hi! Let's work on your PM interview prep. I'll focus on behavioral and leadership questions. What kind of PM role are you going for?",
-  },
-  {
-    id: 'marketing',
-    label: 'Marketing',
-    emoji: '🎯',
-    description: 'Brand, growth & strategy roles',
-    prompt:
-      'marketing roles including brand management, growth marketing, and marketing strategy. Focus on consumer insight, campaign results, cross-functional work, and data-driven decisions.',
-    greeting: "Hey! Let's prep your marketing interview. I'll ask about your past experience and how you think about brand and growth. What role are you targeting?",
-  },
-];
+function buildSystemPrompt(topic: string, userSide: 'for' | 'against', difficulty: Difficulty) {
+  const aiSide = userSide === 'for' ? 'against' : 'for';
+  const style: Record<Difficulty, string> = {
+    beginner:
+      'Argue at a high-school level. Make reasonable points but leave some gaps. ' +
+      'Occasionally make minor concessions when the human makes a good point.',
+    intermediate:
+      'Argue firmly and challenge weak reasoning with specific counterpoints. ' +
+      'Remain collegial but never concede without good reason.',
+    expert:
+      'Argue relentlessly using sophisticated logic, statistics, and precedent. ' +
+      'Expose every logical gap and never concede ground without overwhelming evidence. ' +
+      'Be pointed and aggressive but never personally rude.',
+  };
 
-// ---------------------------------------------------------------------------
-// Audio helpers
-// ---------------------------------------------------------------------------
-
-function toBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let bin = '';
-  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
+  return (
+    `You are a debate opponent arguing ${aiSide} the proposition: "${topic}".\n` +
+    `${style[difficulty]}\n` +
+    `Rules:\n` +
+    `- Keep every response to 2–4 sentences MAX. This is a spoken debate.\n` +
+    `- Counter the human's most recent argument directly and specifically.\n` +
+    `- Never break character or acknowledge being an AI.\n` +
+    `- Never use bullet points or markdown — speak in natural sentences.`
+  );
 }
 
-function fromBase64(b64: string): Int16Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Int16Array(bytes.buffer);
+function transcriptText(messages: Message[]): string {
+  return messages
+    .map((m) => `${m.role === 'user' ? 'User' : 'AI'}: ${m.text}`)
+    .join('\n');
+}
+
+// Browser TTS — simple wrapper around speechSynthesis
+function speak(text: string, onDone: () => void): void {
+  if (typeof window === 'undefined' || !window.speechSynthesis) { onDone(); return; }
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate  = 1.05;
+  utt.pitch = 1.0;
+  // Prefer a natural-sounding voice if available
+  const voices  = window.speechSynthesis.getVoices();
+  const natural = voices.find(
+    (v) =>
+      v.lang.startsWith('en') &&
+      (v.name.includes('Samantha') ||
+        v.name.includes('Karen') ||
+        v.name.includes('Google') ||
+        v.name.includes('Natural')),
+  );
+  if (natural) utt.voice = natural;
+  utt.onend   = () => onDone();
+  utt.onerror = () => onDone();
+  window.speechSynthesis.speak(utt);
 }
 
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
 
-function StatusBadge({ status }: { status: Status }) {
-  const styles: Record<Status, string> = {
-    idle:       'bg-violet-100 text-violet-600',
-    connecting: 'bg-amber-100 text-amber-600 animate-pulse',
-    active:     'bg-emerald-100 text-emerald-700',
-    stopped:    'bg-slate-100 text-slate-500',
-    error:      'bg-red-100 text-red-600',
-  };
-  const labels: Record<Status, string> = {
-    idle:       'Ready',
-    connecting: 'Connecting…',
-    active:     '● Live',
-    stopped:    'Session ended',
-    error:      'Error',
-  };
+function ScoreCard({
+  label,
+  score,
+  feedback,
+}: {
+  label: string;
+  score: number;
+  feedback: string;
+}) {
+  const pct = (score / 10) * 100;
+  const color =
+    score >= 8 ? 'bg-emerald-500' : score >= 6 ? 'bg-violet-500' : score >= 4 ? 'bg-amber-500' : 'bg-rose-500';
   return (
-    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${styles[status]}`}>
-      {labels[status]}
-    </span>
+    <div className="bg-white rounded-2xl border border-violet-100 p-4 shadow-sm">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-semibold text-slate-700">{label}</span>
+        <span className="text-lg font-bold text-slate-900">{score}<span className="text-slate-400 text-sm font-normal">/10</span></span>
+      </div>
+      <div className="h-1.5 bg-slate-100 rounded-full mb-2">
+        <div className={`h-1.5 rounded-full transition-all ${color}`} style={{ width: `${pct}%` }} />
+      </div>
+      <p className="text-xs text-slate-500 leading-snug">{feedback}</p>
+    </div>
   );
 }
 
-function Stars({ rating }: { rating: number }) {
-  const n = Math.max(0, Math.min(5, rating));
+function FallacyBadge({ name, explanation }: { name: string; explanation: string }) {
+  const [open, setOpen] = useState(false);
   return (
-    <span>
-      <span className="text-amber-400">{'★'.repeat(n)}</span>
-      <span className="text-slate-300">{'★'.repeat(5 - n)}</span>
-    </span>
+    <button
+      onClick={() => setOpen(!open)}
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 border border-amber-300 text-amber-700 text-[10px] font-semibold hover:bg-amber-200 transition-colors mt-1"
+    >
+      ⚠ {name}
+      {open && (
+        <span className="font-normal text-amber-600 ml-1">— {explanation}</span>
+      )}
+    </button>
   );
 }
 
@@ -140,164 +147,157 @@ function Stars({ rating }: { rating: number }) {
 // ---------------------------------------------------------------------------
 
 export default function Page() {
-  const [status, setStatus]   = useState<Status>('idle');
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [feedback, setFeedback] = useState<FeedbackItem[]>([]);
-  const [errorMsg, setErrorMsg] = useState('');
-  const [selectedRole, setSelectedRole] = useState<Role>(ROLES[0]);
+  // ── Setup state
+  const [topic,      setTopic]      = useState(TOPICS[0]);
+  const [userSide,   setUserSide]   = useState<'for' | 'against'>('for');
+  const [difficulty, setDifficulty] = useState<Difficulty>('intermediate');
 
-  const wsRef               = useRef<WebSocket | null>(null);
-  const audioCtxRef         = useRef<AudioContext | null>(null);
-  const streamRef           = useRef<MediaStream | null>(null);
-  const sessionReadyRef     = useRef(false);
-  const nextPlayTimeRef     = useRef(0);
-  const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const pendingToolRef      = useRef<{ call_id: string } | null>(null);
-  const msgIdRef            = useRef(0);
-  const fbIdRef             = useRef(0);
+  // ── App state
+  const [phase,          setPhase]          = useState<Phase>('setup');
+  const [turnState,      setTurnState]      = useState<TurnState>('idle');
+  const [messages,       setMessages]       = useState<Message[]>([]);
+  const [partialText,    setPartialText]    = useState('');
+  const [streamingAiText, setStreamingAiText] = useState('');
+  const [scores,         setScores]         = useState<ScoreResult | null>(null);
+  const [errorMsg,       setErrorMsg]       = useState('');
 
-  const transcriptBottomRef = useRef<HTMLDivElement>(null);
+  // ── Stable refs
+  const sttWsRef          = useRef<WebSocket | null>(null);
+  const audioCtxRef       = useRef<AudioContext | null>(null);
+  const streamRef         = useRef<MediaStream | null>(null);
+  const sessionActiveRef  = useRef(false);   // STT session open
+  const suppressAudioRef  = useRef(false);   // true while AI is speaking
+  const historyRef        = useRef<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const userStatementsRef = useRef<string[]>([]);
+  const systemPromptRef   = useRef('');
+  const msgIdRef          = useRef(0);
+  const transcriptRef     = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll
   useEffect(() => {
-    transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    transcriptRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, streamingAiText]);
 
   // ---------------------------------------------------------------------------
-  // Playback
+  // Fallacy detection — fire-and-forget, updates the message after it resolves
   // ---------------------------------------------------------------------------
-
-  const flushPlayback = useCallback(() => {
-    scheduledSourcesRef.current.forEach((src) => {
-      try { src.stop(0); } catch { /* already ended */ }
-    });
-    scheduledSourcesRef.current = [];
-    if (audioCtxRef.current) nextPlayTimeRef.current = audioCtxRef.current.currentTime;
-  }, []);
-
-  const playChunk = useCallback((data: string) => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-
-    // Resume in case the browser auto-suspended the context.
-    if (ctx.state === 'suspended') ctx.resume();
-
-    const int16   = fromBase64(data);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
-
-    const audioBuf = ctx.createBuffer(1, float32.length, 24000);
-    audioBuf.copyToChannel(float32, 0);
-
-    const src = ctx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(ctx.destination);
-
-    // Use a 100 ms ahead-of-now buffer to absorb network jitter.
-    // On the very first chunk nextPlayTimeRef is 0, so we start 100 ms from now.
-    const startAt = Math.max(ctx.currentTime + 0.1, nextPlayTimeRef.current);
-    src.start(startAt);
-    nextPlayTimeRef.current = startAt + audioBuf.duration;
-
-    scheduledSourcesRef.current.push(src);
-    src.onended = () => {
-      scheduledSourcesRef.current = scheduledSourcesRef.current.filter((s) => s !== src);
-    };
+  const checkFallacy = useCallback(async (msgId: number, statement: string) => {
+    try {
+      const res = await fetch('/api/fallacy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          statement,
+          priorStatements: userStatementsRef.current.slice(0, -1), // exclude current
+        }),
+      });
+      const data = (await res.json()) as { fallacy: string | null; explanation: string | null };
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? { ...m, fallacyLoading: false, fallacy: data.fallacy ? { name: data.fallacy, explanation: data.explanation ?? '' } : null }
+            : m,
+        ),
+      );
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === msgId ? { ...m, fallacyLoading: false } : m)),
+      );
+    }
   }, []);
 
   // ---------------------------------------------------------------------------
-  // Message handler
+  // AI turn: call Bedrock, stream response, speak it, then re-enable mic
   // ---------------------------------------------------------------------------
+  const handleUserTurn = useCallback(
+    async (userText: string) => {
+      if (!userText.trim()) return;
 
-  const handleServerEvent = useCallback(
-    (msg: Record<string, unknown>) => {
-      switch (msg.type) {
-        case 'session.ready':
-          sessionReadyRef.current = true;
-          setStatus('active');
-          break;
+      const userMsgId = msgIdRef.current++;
+      setMessages((prev) => [
+        ...prev,
+        { id: userMsgId, role: 'user', text: userText, fallacyLoading: true },
+      ]);
+      userStatementsRef.current.push(userText);
+      historyRef.current.push({ role: 'user', content: userText });
 
-        case 'transcript.user': {
-          // The docs show `transcript` field; browser-integration page shows `text`.
-          // Handle both to be safe.
-          const text = (msg.transcript ?? msg.text) as string | undefined;
-          if (text) {
-            setMessages((prev) => [...prev, { id: msgIdRef.current++, role: 'user', text }]);
-          }
-          break;
+      // Kick off fallacy check in parallel — non-blocking
+      checkFallacy(userMsgId, userText);
+
+      setTurnState('processing');
+      suppressAudioRef.current = true;
+
+      try {
+        // Stream Claude's response
+        const res = await fetch('/api/debate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: historyRef.current,
+            system:   systemPromptRef.current,
+          }),
+        });
+
+        const reader  = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let fullText  = '';
+
+        setTurnState('speaking');
+        setStreamingAiText('');
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          fullText += decoder.decode(value, { stream: true });
+          setStreamingAiText(fullText);
         }
 
-        case 'transcript.agent': {
-          const text = (msg.transcript ?? msg.text) as string | undefined;
-          if (text) {
-            setMessages((prev) => [...prev, { id: msgIdRef.current++, role: 'agent', text }]);
-          }
-          break;
-        }
+        // Commit AI message
+        const aiMsgId = msgIdRef.current++;
+        setMessages((prev) => [...prev, { id: aiMsgId, role: 'ai', text: fullText }]);
+        setStreamingAiText('');
+        historyRef.current.push({ role: 'assistant', content: fullText });
 
-        case 'reply.audio':
-          // Agent audio arrives in `data`, NOT `audio` (that's the input field name).
-          playChunk(msg.data as string);
-          break;
-
-        case 'reply.done': {
-          const interrupted = (msg.status as string) === 'interrupted';
-          if (interrupted) {
-            flushPlayback();
-            pendingToolRef.current = null;
-          } else if (pendingToolRef.current) {
-            wsRef.current?.send(JSON.stringify({
-              type: 'tool.result',
-              call_id: pendingToolRef.current.call_id,
-              result: 'Feedback recorded.',
-            }));
-            pendingToolRef.current = null;
-          }
-          break;
-        }
-
-        case 'tool.call': {
-          if (msg.name === 'save_feedback') {
-            const args =
-              typeof msg.arguments === 'string'
-                ? (JSON.parse(msg.arguments) as { rating: number; note: string })
-                : (msg.arguments as { rating: number; note: string });
-            setFeedback((prev) => [
-              ...prev,
-              { id: fbIdRef.current++, rating: args.rating, note: args.note },
-            ]);
-            pendingToolRef.current = { call_id: msg.call_id as string };
-          }
-          break;
-        }
-
-        case 'session.error':
-          setErrorMsg(`Session error: ${(msg.code as string) ?? 'unknown'}`);
-          setStatus('error');
-          break;
-
-        default:
-          break;
+        // Speak via browser TTS, then re-enable mic
+        speak(fullText, () => {
+          suppressAudioRef.current = false;
+          setTurnState('listening');
+        });
+      } catch (err) {
+        console.error('Debate call failed:', err);
+        setErrorMsg('Failed to get AI response. Check AWS Bedrock credentials.');
+        suppressAudioRef.current = false;
+        setTurnState('listening');
       }
     },
-    [playChunk, flushPlayback],
+    [checkFallacy],
   );
 
   // ---------------------------------------------------------------------------
-  // Start / Stop
+  // Start debate
   // ---------------------------------------------------------------------------
-
-  const start = useCallback(async (role: Role) => {
+  const startDebate = useCallback(async () => {
     setErrorMsg('');
     setMessages([]);
-    setFeedback([]);
-    setStatus('connecting');
-    sessionReadyRef.current = false;
-    pendingToolRef.current  = null;
-    nextPlayTimeRef.current = 0;
+    setPartialText('');
+    setStreamingAiText('');
+    setScores(null);
+    historyRef.current        = [];
+    userStatementsRef.current = [];
+    systemPromptRef.current   = buildSystemPrompt(topic, userSide, difficulty);
+    msgIdRef.current          = 0;
+
+    setPhase('debate');
+    setTurnState('idle');
 
     try {
-      // Set up audio FIRST (slow), then mint token right before opening the WebSocket
-      // so the token doesn't expire during AudioWorklet/mic setup.
-      const audioCtx = new AudioContext({ sampleRate: 24000 });
+      // Mint STT token (no Bearer prefix for streaming STT)
+      const tokenRes = await fetch('/api/aai-token');
+      if (!tokenRes.ok) throw new Error('Failed to get AssemblyAI token');
+      const { token } = (await tokenRes.json()) as { token: string };
+
+      // AudioContext at 16 kHz (STT target)
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
       await audioCtx.resume();
       await audioCtx.audioWorklet.addModule('/worklet.js');
@@ -307,285 +307,418 @@ export default function Page() {
       });
       streamRef.current = stream;
 
-      // Mint token last — tokens are single-use and expire quickly.
-      const tokenRes = await fetch('/api/token');
-      if (!tokenRes.ok) {
-        const body = await tokenRes.json().catch(() => ({}));
-        throw new Error((body as { error?: string }).error ?? 'Failed to fetch session token');
-      }
-      const { token } = (await tokenRes.json()) as { token: string };
+      const source     = audioCtx.createMediaStreamSource(stream);
+      const worklet    = new AudioWorkletNode(audioCtx, 'pcm-processor', {
+        processorOptions: { targetSampleRate: 16000 },
+      });
+      source.connect(worklet);
 
-      const micSource  = audioCtx.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
-      micSource.connect(workletNode);
-      // Do NOT connect to destination — would cause mic feedback through speakers.
-
-      const ws = new WebSocket(`wss://agents.assemblyai.com/v1/ws?token=${token}`);
-      wsRef.current = ws;
+      // AssemblyAI Streaming STT WebSocket
+      // Sends raw binary PCM16 frames; receives JSON Turn events
+      const ws = new WebSocket(
+        `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&speech_model=u3-rt-pro&token=${token}`,
+      );
+      sttWsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({
-          type: 'session.update',
-          session: {
-            system_prompt:
-              `You are a friendly but sharp mock interview coach running a spoken practice behavioral interview for ${role.prompt} ` +
-              'Ask one behavioral question at a time, listen to the answer, then ask one natural follow-up before moving on. ' +
-              'Keep your turns short and conversational — this is spoken aloud, not read. ' +
-              'Cover 4–5 questions total. After each candidate answer, call save_feedback with a 1–5 rating and a one-line coaching note. ' +
-              'When done, give a brief spoken summary of two strengths and one or two things to work on.',
-            greeting: role.greeting,
-            input: {
-              format: { encoding: 'audio/pcm' },
-              turn_detection: {
-                vad_threshold: 0.5,
-                min_silence: 400,
-                max_silence: 1500,
-                interrupt_response: true,
-              },
-            },
-            output: {
-              voice: 'ivy',
-              format: { encoding: 'audio/pcm' },
-            },
-            tools: [{
-              type: 'function',
-              name: 'save_feedback',
-              description: "Record an assessment of the candidate's most recent answer.",
-              parameters: {
-                type: 'object',
-                properties: {
-                  rating: { type: 'integer', description: '1–5 quality score' },
-                  note:   { type: 'string',  description: 'One-line coaching observation' },
-                },
-                required: ['rating', 'note'],
-              },
-            }],
-          },
-        }));
+        sessionActiveRef.current = true;
+        setTurnState('listening');
       };
 
       ws.onmessage = (ev) => {
-        try { handleServerEvent(JSON.parse(ev.data as string)); } catch { /* ignore */ }
+        try {
+          const msg = JSON.parse(ev.data as string) as {
+            type: string;
+            transcript?: string;
+            end_of_turn?: boolean;
+          };
+
+          if (msg.type === 'Turn') {
+            if (msg.end_of_turn) {
+              // Finalized — trigger AI response
+              setPartialText('');
+              if (msg.transcript?.trim()) handleUserTurn(msg.transcript);
+            } else {
+              // Partial — show live
+              setPartialText(msg.transcript ?? '');
+            }
+          }
+        } catch { /* ignore malformed frames */ }
       };
 
-      ws.onclose = (ev) => {
-        sessionReadyRef.current = false;
-        setStatus((s) => (s === 'active' || s === 'connecting' ? 'stopped' : s));
-        if (ev.code === 1008 || ev.code === 1006) {
-          setErrorMsg(`Auth failed (code ${ev.code}) — the session token was rejected. Check that ASSEMBLYAI_API_KEY is valid and has Voice Agent access.`);
-        }
+      ws.onclose = () => {
+        sessionActiveRef.current = false;
       };
 
       ws.onerror = () => {
-        setErrorMsg('WebSocket error. Check your API key and mic permissions.');
-        setStatus('error');
+        setErrorMsg('STT WebSocket error. Check ASSEMBLYAI_API_KEY.');
       };
 
-      workletNode.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
-        if (!sessionReadyRef.current) return;
-        if (ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ type: 'input.audio', audio: toBase64(ev.data) }));
+      // Forward mic audio as raw binary (NOT base64 — streaming STT takes binary frames)
+      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+        if (!sessionActiveRef.current) return;
+        if (suppressAudioRef.current) return; // don't send while AI is speaking
+        if (ws.readyState === WebSocket.OPEN) ws.send(e.data);
       };
+
+      // Opening message from AI coach
+      setTurnState('speaking');
+      suppressAudioRef.current = true;
+      const openingMsg =
+        `Welcome to the debate. The topic is: "${topic}". You will argue ${userSide} this proposition. I will argue ${userSide === 'for' ? 'against' : 'for'} it. Make your opening statement.`;
+      const aiOpeningId = msgIdRef.current++;
+      setMessages([{ id: aiOpeningId, role: 'ai', text: openingMsg }]);
+      speak(openingMsg, () => {
+        suppressAudioRef.current = false;
+        setTurnState('listening');
+      });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
-      setStatus('error');
+      setPhase('setup');
     }
-  }, [handleServerEvent]);
+  }, [topic, userSide, difficulty, handleUserTurn]);
 
-  const stop = useCallback(() => {
-    sessionReadyRef.current = false;
-    wsRef.current?.close(1000, 'User ended session');
-    wsRef.current = null;
+  // ---------------------------------------------------------------------------
+  // End debate
+  // ---------------------------------------------------------------------------
+  const endDebate = useCallback(async () => {
+    window.speechSynthesis?.cancel();
+    suppressAudioRef.current  = false;
+    sessionActiveRef.current  = false;
+
+    if (sttWsRef.current?.readyState === WebSocket.OPEN) {
+      sttWsRef.current.send(JSON.stringify({ type: 'Terminate' }));
+      sttWsRef.current.close();
+    }
+    sttWsRef.current = null;
+
     streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current  = null;
+    streamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
-    flushPlayback();
-    setStatus('stopped');
-  }, [flushPlayback]);
+
+    setPhase('scoring');
+    setTurnState('idle');
+
+    try {
+      const res = await fetch('/api/score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: transcriptText(messages),
+          topic,
+          userSide: userSide === 'for' ? `FOR: "${topic}"` : `AGAINST: "${topic}"`,
+        }),
+      });
+      const data = (await res.json()) as ScoreResult;
+      setScores(data);
+      setPhase('results');
+    } catch {
+      setErrorMsg('Scoring failed. Check AWS credentials.');
+      setPhase('results');
+    }
+  }, [messages, topic, userSide]);
 
   // ---------------------------------------------------------------------------
-  // Render
+  // Render helpers
   // ---------------------------------------------------------------------------
 
-  const isIdle      = status === 'idle' || status === 'stopped' || status === 'error';
-  const showContent = messages.length > 0 || feedback.length > 0;
-  const avgRating   = feedback.length
-    ? feedback.reduce((s, f) => s + f.rating, 0) / feedback.length
-    : 0;
+  const statusConfig: Record<TurnState, { label: string; color: string; pulse: boolean }> = {
+    idle:       { label: 'Getting ready…', color: 'bg-slate-400',   pulse: false },
+    listening:  { label: 'Listening',       color: 'bg-emerald-500', pulse: true  },
+    processing: { label: 'Thinking',        color: 'bg-violet-500',  pulse: true  },
+    speaking:   { label: 'AI Speaking',     color: 'bg-blue-500',    pulse: true  },
+  };
+  const statusInfo = statusConfig[turnState];
 
-  return (
-    <main className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-slate-100 text-slate-800 flex flex-col font-sans">
-
-      {/* ── Header ── */}
-      <header className="bg-white/80 backdrop-blur border-b border-violet-100 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-violet-600 flex items-center justify-center text-white text-lg shadow-sm">
-            🎙️
-          </div>
-          <div>
-            <h1 className="font-bold text-slate-900 leading-tight">Interview Coach</h1>
-            <p className="text-violet-400 text-xs">Powered by AssemblyAI</p>
-          </div>
-        </div>
-        <StatusBadge status={status} />
-      </header>
-
-      {/* ── Body ── */}
-      <div className="flex-1 flex flex-col max-w-5xl w-full mx-auto px-4 py-8 gap-6">
-
-        {/* ── Role selector (shown when not in active session) ── */}
-        {isIdle && (
-          <div className="flex flex-col items-center gap-5">
-            <div className="text-center">
-              <h2 className="text-2xl font-bold text-slate-900">Pick your interview track</h2>
-              <p className="text-slate-500 text-sm mt-1">
-                Your coach will tailor every question to the role you choose.
-              </p>
+  // ---------------------------------------------------------------------------
+  // SETUP SCREEN
+  // ---------------------------------------------------------------------------
+  if (phase === 'setup') {
+    return (
+      <main className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-slate-100 flex flex-col font-sans">
+        <header className="bg-white/80 backdrop-blur border-b border-violet-100 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-violet-600 flex items-center justify-center text-white text-lg shadow-sm">⚔️</div>
+            <div>
+              <h1 className="font-bold text-slate-900">Debate Coach</h1>
+              <p className="text-violet-400 text-xs">AssemblyAI STT · Claude on Bedrock</p>
             </div>
+          </div>
+        </header>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 w-full">
-              {ROLES.map((role) => (
+        <div className="flex-1 max-w-3xl w-full mx-auto px-4 py-10 flex flex-col gap-8">
+          {/* Topic */}
+          <section>
+            <h2 className="font-semibold text-slate-800 mb-3">Choose a topic</h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {TOPICS.map((t) => (
                 <button
-                  key={role.id}
-                  onClick={() => setSelectedRole(role)}
-                  className={`flex flex-col items-center gap-2 p-4 rounded-2xl border-2 transition-all text-center ${
-                    selectedRole.id === role.id
-                      ? 'border-violet-500 bg-violet-50 shadow-md shadow-violet-100'
-                      : 'border-slate-200 bg-white hover:border-violet-300 hover:bg-violet-50/50'
+                  key={t}
+                  onClick={() => setTopic(t)}
+                  className={`text-left px-4 py-3 rounded-xl border-2 text-sm transition-all ${
+                    topic === t
+                      ? 'border-violet-500 bg-violet-50 font-semibold text-violet-800'
+                      : 'border-slate-200 bg-white text-slate-700 hover:border-violet-300 hover:bg-violet-50/50'
                   }`}
                 >
-                  <span className="text-2xl">{role.emoji}</span>
-                  <span className="text-xs font-semibold text-slate-700 leading-tight">{role.label}</span>
-                  <span className="text-[10px] text-slate-400 leading-tight">{role.description}</span>
+                  {t}
                 </button>
               ))}
             </div>
+          </section>
 
-            <button
-              onClick={() => start(selectedRole)}
-              className="mt-1 px-10 py-4 bg-violet-600 hover:bg-violet-500 active:scale-95 text-white rounded-2xl font-semibold text-lg transition-all shadow-lg shadow-violet-200 focus:outline-none focus:ring-2 focus:ring-violet-400"
-            >
-              Start {selectedRole.emoji} Interview
-            </button>
-
-            {errorMsg && (
-              <p className="text-red-500 text-sm text-center max-w-md bg-red-50 border border-red-200 rounded-xl px-4 py-2">
-                {errorMsg}
-              </p>
-            )}
-          </div>
-        )}
-
-        {/* ── Connecting spinner ── */}
-        {status === 'connecting' && (
-          <div className="flex flex-col items-center gap-3 py-8">
-            <div className="w-12 h-12 rounded-full border-4 border-violet-200 border-t-violet-600 animate-spin" />
-            <p className="text-slate-500 text-sm">Setting up your session…</p>
-          </div>
-        )}
-
-        {/* ── Active controls ── */}
-        {status === 'active' && (
-          <div className="flex items-center justify-between bg-white rounded-2xl border border-violet-100 px-5 py-3 shadow-sm">
-            <div className="flex items-center gap-2.5">
-              <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-sm font-medium text-slate-700">
-                {selectedRole.emoji} {selectedRole.label} interview — microphone live
-              </span>
+          {/* Side */}
+          <section>
+            <h2 className="font-semibold text-slate-800 mb-3">Your side</h2>
+            <div className="flex gap-3">
+              {(['for', 'against'] as const).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setUserSide(s)}
+                  className={`flex-1 py-3 rounded-xl border-2 font-semibold text-sm capitalize transition-all ${
+                    userSide === s
+                      ? s === 'for'
+                        ? 'border-emerald-500 bg-emerald-50 text-emerald-700'
+                        : 'border-rose-500 bg-rose-50 text-rose-700'
+                      : 'border-slate-200 bg-white text-slate-600 hover:border-violet-300'
+                  }`}
+                >
+                  {s === 'for' ? '👍 For' : '👎 Against'}
+                </button>
+              ))}
             </div>
-            <button
-              onClick={stop}
-              className="px-4 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded-xl text-sm font-medium transition-all"
-            >
-              End Session
-            </button>
-          </div>
-        )}
+            <p className="text-xs text-slate-400 mt-2">
+              You argue <strong>{userSide}</strong> the proposition. AI argues <strong>{userSide === 'for' ? 'against' : 'for'}</strong> it.
+            </p>
+          </section>
 
-        {/* ── Stopped banner ── */}
-        {status === 'stopped' && !showContent && (
-          <div className="flex flex-col items-center gap-3 py-4">
-            <p className="text-slate-500 text-sm">Session ended.</p>
-          </div>
-        )}
-
-        {/* ── Conversation + Feedback ── */}
-        {showContent && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-
-            {/* Transcript */}
-            <section className="lg:col-span-2 bg-white rounded-2xl border border-violet-100 shadow-sm flex flex-col overflow-hidden max-h-[62vh]">
-              <div className="px-4 py-2.5 border-b border-violet-50 flex items-center gap-2">
-                <span className="text-xs font-semibold text-violet-500 uppercase tracking-widest">Conversation</span>
-              </div>
-              <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
-                {messages.map((m) => (
-                  <div
-                    key={m.id}
-                    className={`flex gap-2 items-end ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    {m.role === 'agent' && (
-                      <div className="w-7 h-7 rounded-full bg-violet-100 border border-violet-200 flex items-center justify-center text-sm shrink-0">
-                        🤖
-                      </div>
-                    )}
-                    <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
-                      m.role === 'user'
-                        ? 'bg-violet-600 text-white rounded-br-sm shadow-sm'
-                        : 'bg-violet-50 text-slate-800 border border-violet-100 rounded-bl-sm'
-                    }`}>
-                      {m.text}
-                    </div>
-                    {m.role === 'user' && (
-                      <div className="w-7 h-7 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-sm shrink-0">
-                        🧑
-                      </div>
-                    )}
+          {/* Difficulty */}
+          <section>
+            <h2 className="font-semibold text-slate-800 mb-3">Difficulty</h2>
+            <div className="flex gap-3">
+              {(Object.keys(DIFFICULTY) as Difficulty[]).map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setDifficulty(d)}
+                  className={`flex-1 py-3 px-2 rounded-xl border-2 text-sm transition-all ${
+                    difficulty === d
+                      ? 'border-violet-500 bg-violet-50 text-violet-800'
+                      : 'border-slate-200 bg-white text-slate-600 hover:border-violet-300'
+                  }`}
+                >
+                  <div className="font-semibold">{DIFFICULTY[d].label}</div>
+                  <div className="text-[10px] text-slate-400 mt-0.5 leading-tight hidden sm:block">
+                    {DIFFICULTY[d].description}
                   </div>
-                ))}
-                <div ref={transcriptBottomRef} />
-              </div>
-            </section>
+                </button>
+              ))}
+            </div>
+          </section>
 
-            {/* Feedback */}
-            <section className="bg-white rounded-2xl border border-violet-100 shadow-sm flex flex-col overflow-hidden max-h-[62vh]">
-              <div className="px-4 py-2.5 border-b border-violet-50">
-                <span className="text-xs font-semibold text-violet-500 uppercase tracking-widest">Coach Feedback</span>
-              </div>
-              <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2.5">
-                {feedback.length === 0 ? (
-                  <p className="text-slate-400 text-xs text-center mt-8 leading-relaxed px-2">
-                    Scores appear here after each answer
-                  </p>
-                ) : (
-                  feedback.map((f, i) => (
-                    <div key={f.id} className="bg-violet-50 rounded-xl p-3 border border-violet-100">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-semibold text-violet-600">Answer {i + 1}</span>
-                        <div className="flex items-center gap-1">
-                          <Stars rating={f.rating} />
-                          <span className="text-xs text-slate-400 ml-1">{f.rating}/5</span>
-                        </div>
-                      </div>
-                      <p className="text-xs text-slate-600 leading-snug">{f.note}</p>
-                    </div>
-                  ))
-                )}
+          {errorMsg && (
+            <p className="text-red-500 text-sm bg-red-50 border border-red-200 rounded-xl px-4 py-2">{errorMsg}</p>
+          )}
+
+          <button
+            onClick={startDebate}
+            className="w-full py-4 bg-violet-600 hover:bg-violet-500 active:scale-[0.99] text-white rounded-2xl font-semibold text-lg transition-all shadow-lg shadow-violet-200"
+          >
+            Start Debate ⚔️
+          </button>
+        </div>
+      </main>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // SCORING SCREEN
+  // ---------------------------------------------------------------------------
+  if (phase === 'scoring') {
+    return (
+      <main className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-slate-100 flex items-center justify-center font-sans">
+        <div className="text-center flex flex-col items-center gap-4">
+          <div className="w-14 h-14 rounded-full border-4 border-violet-200 border-t-violet-600 animate-spin" />
+          <p className="text-slate-600 font-medium">Generating your performance review…</p>
+          <p className="text-slate-400 text-sm">Claude is reading the full transcript</p>
+        </div>
+      </main>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // RESULTS SCREEN
+  // ---------------------------------------------------------------------------
+  if (phase === 'results') {
+    return (
+      <main className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-slate-100 font-sans">
+        <header className="bg-white/80 backdrop-blur border-b border-violet-100 px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-violet-600 flex items-center justify-center text-white text-lg">⚔️</div>
+            <h1 className="font-bold text-slate-900">Debate Results</h1>
+          </div>
+          <button
+            onClick={() => { setPhase('setup'); setMessages([]); }}
+            className="px-4 py-2 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-sm font-semibold transition-all"
+          >
+            Debate Again
+          </button>
+        </header>
+
+        <div className="max-w-3xl mx-auto px-4 py-8 flex flex-col gap-6">
+          {/* Topic recap */}
+          <div className="bg-white rounded-2xl border border-violet-100 p-4 shadow-sm">
+            <p className="text-xs text-violet-500 font-semibold uppercase tracking-widest mb-1">Topic</p>
+            <p className="text-slate-800 font-medium">"{topic}"</p>
+            <p className="text-xs text-slate-400 mt-1">You argued <strong>{userSide}</strong> · {DIFFICULTY[difficulty].label}</p>
+          </div>
+
+          {scores ? (
+            <>
+              {/* Overall */}
+              <div className={`rounded-2xl p-5 text-white shadow-md ${
+                scores.overall.score >= 8 ? 'bg-emerald-500' :
+                scores.overall.score >= 6 ? 'bg-violet-600' :
+                scores.overall.score >= 4 ? 'bg-amber-500' : 'bg-rose-500'
+              }`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-bold text-lg">Overall Score</span>
+                  <span className="text-3xl font-black">{scores.overall.score}<span className="text-base font-normal opacity-80">/10</span></span>
+                </div>
+                <p className="text-white/90 text-sm leading-relaxed">{scores.overall.summary}</p>
               </div>
 
-              {feedback.length >= 2 && (
-                <div className="border-t border-violet-50 px-4 py-3 flex items-center justify-between bg-violet-50/50">
-                  <span className="text-xs font-semibold text-slate-500">Average</span>
-                  <div className="flex items-center gap-1.5">
-                    <Stars rating={Math.round(avgRating)} />
-                    <span className="text-xs font-bold text-violet-700 ml-1">{avgRating.toFixed(1)}</span>
+              {/* Criteria grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <ScoreCard label="Argument Strength"   score={scores.argumentStrength.score}   feedback={scores.argumentStrength.feedback}   />
+                <ScoreCard label="Logical Consistency" score={scores.logicalConsistency.score} feedback={scores.logicalConsistency.feedback} />
+                <ScoreCard label="Use of Evidence"     score={scores.useOfEvidence.score}      feedback={scores.useOfEvidence.feedback}      />
+                <ScoreCard label="Rebuttal Quality"    score={scores.rebuttalQuality.score}    feedback={scores.rebuttalQuality.feedback}    />
+              </div>
+            </>
+          ) : (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-red-600 text-sm">{errorMsg || 'Scoring unavailable.'}</div>
+          )}
+
+          {/* Transcript recap */}
+          <section className="bg-white rounded-2xl border border-violet-100 shadow-sm overflow-hidden">
+            <div className="px-4 py-2.5 border-b border-violet-50">
+              <span className="text-xs font-semibold text-violet-500 uppercase tracking-widest">Full Transcript</span>
+            </div>
+            <div className="p-4 flex flex-col gap-2 max-h-64 overflow-y-auto">
+              {messages.map((m) => (
+                <div key={m.id} className={`flex gap-2 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[80%] px-3 py-2 rounded-xl text-xs leading-relaxed ${
+                    m.role === 'user' ? 'bg-violet-600 text-white' : 'bg-violet-50 text-slate-700 border border-violet-100'
+                  }`}>
+                    {m.text}
+                    {m.fallacy && <FallacyBadge name={m.fallacy.name} explanation={m.fallacy.explanation} />}
                   </div>
                 </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      </main>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // DEBATE SCREEN
+  // ---------------------------------------------------------------------------
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-slate-100 flex flex-col font-sans">
+      {/* Header */}
+      <header className="bg-white/80 backdrop-blur border-b border-violet-100 px-4 py-3 flex items-center gap-3 shrink-0">
+        <div className="w-8 h-8 rounded-xl bg-violet-600 flex items-center justify-center text-white text-base shrink-0">⚔️</div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs text-violet-500 font-semibold uppercase tracking-widest">Debating</p>
+          <p className="text-sm font-semibold text-slate-800 truncate">"{topic}"</p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="hidden sm:inline-flex px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[10px] font-semibold uppercase">
+            You: {userSide}
+          </span>
+          <span className="hidden sm:inline-flex px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 text-[10px] font-semibold uppercase">
+            AI: {userSide === 'for' ? 'against' : 'for'}
+          </span>
+          <button
+            onClick={endDebate}
+            className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded-xl text-xs font-semibold transition-all"
+          >
+            End &amp; Score
+          </button>
+        </div>
+      </header>
+
+      {/* Status bar */}
+      <div className="bg-white border-b border-violet-50 px-4 py-2 flex items-center gap-2">
+        <div className={`w-2 h-2 rounded-full ${statusInfo.color} ${statusInfo.pulse ? 'animate-pulse' : ''}`} />
+        <span className="text-xs font-medium text-slate-600">{statusInfo.label}</span>
+        {errorMsg && <span className="text-xs text-red-500 ml-2">{errorMsg}</span>}
+      </div>
+
+      {/* Transcript */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-3">
+        {messages.map((m) => (
+          <div key={m.id} className={`flex gap-2 items-end ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            {m.role === 'ai' && (
+              <div className="w-7 h-7 rounded-full bg-violet-100 border border-violet-200 flex items-center justify-center text-sm shrink-0">🤖</div>
+            )}
+            <div className={`max-w-[78%] flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+              <div className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                m.role === 'user'
+                  ? 'bg-violet-600 text-white rounded-br-sm shadow-sm'
+                  : 'bg-white text-slate-800 border border-violet-100 rounded-bl-sm shadow-sm'
+              }`}>
+                {m.text}
+              </div>
+              {/* Fallacy badge */}
+              {m.role === 'user' && m.fallacyLoading && (
+                <span className="text-[10px] text-slate-400 mt-1 animate-pulse">checking logic…</span>
               )}
-            </section>
+              {m.role === 'user' && m.fallacy && (
+                <FallacyBadge name={m.fallacy.name} explanation={m.fallacy.explanation} />
+              )}
+            </div>
+            {m.role === 'user' && (
+              <div className="w-7 h-7 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-sm shrink-0">🧑</div>
+            )}
+          </div>
+        ))}
+
+        {/* Streaming AI response */}
+        {streamingAiText && (
+          <div className="flex gap-2 items-end justify-start">
+            <div className="w-7 h-7 rounded-full bg-violet-100 border border-violet-200 flex items-center justify-center text-sm shrink-0">🤖</div>
+            <div className="max-w-[78%] px-4 py-2.5 rounded-2xl rounded-bl-sm text-sm leading-relaxed bg-white text-slate-800 border border-violet-100 shadow-sm">
+              {streamingAiText}
+              <span className="inline-block w-1.5 h-3.5 bg-violet-400 ml-1 animate-pulse rounded-sm" />
+            </div>
           </div>
         )}
+
+        {/* Live partial STT */}
+        {partialText && !streamingAiText && (
+          <div className="flex gap-2 items-end justify-end">
+            <div className="max-w-[78%] px-4 py-2.5 rounded-2xl rounded-br-sm text-sm bg-violet-100 text-violet-600 border border-violet-200 italic">
+              {partialText}
+            </div>
+            <div className="w-7 h-7 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-sm shrink-0">🧑</div>
+          </div>
+        )}
+
+        <div ref={transcriptRef} />
+      </div>
+
+      {/* Bottom hint */}
+      <div className="bg-white/80 border-t border-violet-100 px-4 py-2 text-center">
+        <p className="text-xs text-slate-400">
+          {turnState === 'listening' && 'Speak now — your mic is live'}
+          {turnState === 'processing' && 'Claude is thinking…'}
+          {turnState === 'speaking' && 'AI is responding — your mic is paused'}
+          {turnState === 'idle' && 'Starting up…'}
+        </p>
       </div>
     </main>
   );

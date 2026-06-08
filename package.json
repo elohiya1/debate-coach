@@ -1,5 +1,5 @@
 {
-  "name": "interview-coach",
+  "name": "debate-coach",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.600.0",
     "next": "^14.2.0",
     "react": "^18",
     "react-dom": "^18"
